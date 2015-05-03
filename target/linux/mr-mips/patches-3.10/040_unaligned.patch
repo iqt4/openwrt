@@ -1,0 +1,376 @@
+---- linux-3.3.5/net/ipv4/tcp_input.c	2012-05-11 09:59:10.000000000 +0300
+-+++ linux/net/ipv4/tcp_input.c	2013-06-14 13:19:27.359982820 +0300
+-@@ -3948,13 +3948,13 @@ static int tcp_parse_aligned_timestamp(s
+- {
+- 	const __be32 *ptr = (const __be32 *)(th + 1);
+- 
+--	if (*ptr == htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16)
+-+	if (get_unaligned_be32(ptr) == htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16)
+- 			  | (TCPOPT_TIMESTAMP << 8) | TCPOLEN_TIMESTAMP)) {
+- 		tp->rx_opt.saw_tstamp = 1;
+- 		++ptr;
+--		tp->rx_opt.rcv_tsval = ntohl(*ptr);
+-+		tp->rx_opt.rcv_tsval = ntohl(get_unaligned(ptr));
+- 		++ptr;
+--		tp->rx_opt.rcv_tsecr = ntohl(*ptr);
+-+		tp->rx_opt.rcv_tsecr = ntohl(get_unaligned(ptr));
+- 		return 1;
+- 	}
+- 	return 0;
+--- a/include/linux/etherdevice.h
++++ b/include/linux/etherdevice.h
+@@ -212,7 +212,9 @@ static inline unsigned compare_ether_add
+ 	const u16 *b = (const u16 *) addr2;
+ 
+ 	BUILD_BUG_ON(ETH_ALEN != 6);
+-	return ((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2])) != 0;
++
++	return ((get_unaligned((u32 *) addr1) ^ get_unaligned((u32 *) addr2))
++		| (get_unaligned(&a[2]) ^ get_unaligned(&b[2]))) != 0;
+ }
+ 
+ /**
+--- a/include/net/ndisc.h
++++ b/include/net/ndisc.h
+@@ -52,6 +52,7 @@ enum {
+ #include <linux/hash.h>
+ 
+ #include <net/neighbour.h>
++#include <asm/unaligned.h>
+ 
+ struct ctl_table;
+ struct inet6_dev;
+@@ -65,7 +66,7 @@ struct nd_msg {
+         struct icmp6hdr	icmph;
+         struct in6_addr	target;
+ 	__u8		opt[0];
+-};
++} __attribute__((packed));
+ 
+ struct rs_msg {
+ 	struct icmp6hdr	icmph;
+@@ -148,10 +149,10 @@ static inline u32 ndisc_hashfn(const voi
+ {
+ 	const u32 *p32 = pkey;
+ 
+-	return (((p32[0] ^ hash32_ptr(dev)) * hash_rnd[0]) +
+-		(p32[1] * hash_rnd[1]) +
+-		(p32[2] * hash_rnd[2]) +
+-		(p32[3] * hash_rnd[3]));
++	return (((get_unaligned(&p32[0]) ^ dev->ifindex) * hash_rnd[0]) +
++		(get_unaligned(&p32[1]) * hash_rnd[1]) +
++		(get_unaligned(&p32[2]) * hash_rnd[2]) +
++		(get_unaligned(&p32[3]) * hash_rnd[3]));
+ }
+ 
+ static inline struct neighbour *__ipv6_neigh_lookup_noref(struct net_device *dev, const void *pkey)
+--- a/net/bridge/netfilter/ebt_arp.c
++++ b/net/bridge/netfilter/ebt_arp.c
+@@ -52,13 +52,13 @@ ebt_arp_mt(const struct sk_buff *skb, st
+ 		if (dap == NULL)
+ 			return false;
+ 		if (info->bitmask & EBT_ARP_SRC_IP &&
+-		    FWINV(info->saddr != (*sap & info->smsk), EBT_ARP_SRC_IP))
++		    FWINV(info->saddr != (get_unaligned(sap) & info->smsk), EBT_ARP_SRC_IP))
+ 			return false;
+ 		if (info->bitmask & EBT_ARP_DST_IP &&
+-		    FWINV(info->daddr != (*dap & info->dmsk), EBT_ARP_DST_IP))
++		    FWINV(info->daddr != (get_unaligned(dap) & info->dmsk), EBT_ARP_DST_IP))
+ 			return false;
+ 		if (info->bitmask & EBT_ARP_GRAT &&
+-		    FWINV(*dap != *sap, EBT_ARP_GRAT))
++		    FWINV(get_unaligned(dap) != get_unaligned(sap), EBT_ARP_GRAT))
+ 			return false;
+ 	}
+ 
+--- a/net/bridge/netfilter/ebt_arpreply.c
++++ b/net/bridge/netfilter/ebt_arpreply.c
+@@ -51,8 +51,8 @@ ebt_arpreply_tg(struct sk_buff *skb, con
+ 	if (diptr == NULL)
+ 		return EBT_DROP;
+ 
+-	arp_send(ARPOP_REPLY, ETH_P_ARP, *siptr, (struct net_device *)par->in,
+-		 *diptr, shp, info->mac, shp);
++	arp_send(ARPOP_REPLY, ETH_P_ARP, get_unaligned(siptr), (struct net_device *)par->in,
++		 get_unaligned(diptr), shp, info->mac, shp);
+ 
+ 	return info->target;
+ }
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -157,7 +157,7 @@ ipv6:
+ 		ports = skb_header_pointer(skb, nhoff + poff,
+ 					   sizeof(_ports), &_ports);
+ 		if (ports)
+-			flow->ports = *ports;
++			flow->ports = get_unaligned_be32(ports);
+ 	}
+ 
+ 	flow->thoff = (u16) nhoff;
+--- a/net/core/secure_seq.c
++++ b/net/core/secure_seq.c
+@@ -9,6 +9,7 @@
+ #include <linux/string.h>
+ 
+ #include <net/secure_seq.h>
++#include <asm/unaligned.h>
+ 
+ #if IS_ENABLED(CONFIG_IPV6) || IS_ENABLED(CONFIG_INET)
+ #define NET_SECRET_SIZE (MD5_MESSAGE_BYTES / 4)
+@@ -60,7 +61,7 @@ __u32 secure_tcpv6_sequence_number(const
+ 	net_secret_init();
+ 	memcpy(hash, saddr, 16);
+ 	for (i = 0; i < 4; i++)
+-		secret[i] = net_secret[i] + (__force u32)daddr[i];
++		secret[i] = net_secret[i] + (__force u32) get_unaligned(&daddr[i]);
+ 	secret[4] = net_secret[4] +
+ 		(((__force u16)sport << 16) + (__force u16)dport);
+ 	for (i = 5; i < MD5_MESSAGE_BYTES / 4; i++)
+@@ -82,7 +83,7 @@ u32 secure_ipv6_port_ephemeral(const __b
+ 	net_secret_init();
+ 	memcpy(hash, saddr, 16);
+ 	for (i = 0; i < 4; i++)
+-		secret[i] = net_secret[i] + (__force u32) daddr[i];
++		secret[i] = net_secret[i] + (__force u32) get_unaligned(&daddr[i]);
+ 	secret[4] = net_secret[4] + (__force u32)dport;
+ 	for (i = 5; i < MD5_MESSAGE_BYTES / 4; i++)
+ 		secret[i] = net_secret[i];
+@@ -136,6 +137,7 @@ __u32 secure_tcp_sequence_number(__be32
+ 
+ 	return seq_scale(hash[0]);
+ }
++EXPORT_SYMBOL_GPL(secure_tcp_sequence_number);
+ 
+ u32 secure_ipv4_port_ephemeral(__be32 saddr, __be32 daddr, __be16 dport)
+ {
+--- a/net/core/utils.c
++++ b/net/core/utils.c
+@@ -32,6 +32,7 @@
+ 
+ #include <asm/byteorder.h>
+ #include <asm/uaccess.h>
++#include <asm/unaligned.h>
+ 
+ int net_msg_warn __read_mostly = 1;
+ EXPORT_SYMBOL(net_msg_warn);
+@@ -308,14 +309,18 @@ void inet_proto_csum_replace4(__sum16 *s
+ {
+ 	__be32 diff[] = { ~from, to };
+ 	if (skb->ip_summed != CHECKSUM_PARTIAL) {
+-		*sum = csum_fold(csum_partial(diff, sizeof(diff),
+-				~csum_unfold(*sum)));
++		put_unaligned(
++		    csum_fold(csum_partial(diff, sizeof(diff),
++					   ~csum_unfold(get_unaligned(sum)))),
++		    sum);
+ 		if (skb->ip_summed == CHECKSUM_COMPLETE && pseudohdr)
+ 			skb->csum = ~csum_partial(diff, sizeof(diff),
+ 						~skb->csum);
+ 	} else if (pseudohdr)
+-		*sum = ~csum_fold(csum_partial(diff, sizeof(diff),
+-				csum_unfold(*sum)));
++	    put_unaligned(
++		~csum_fold(csum_partial(diff, sizeof(diff),
++					csum_unfold(get_unaligned(sum)))),
++		sum);
+ }
+ EXPORT_SYMBOL(inet_proto_csum_replace4);
+ 
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -52,6 +52,7 @@
+ #include <linux/errno.h>
+ #include <linux/init.h>
+ #include <linux/if_ether.h>
++#include <linux/if_vlan.h>
+ #include <net/dst.h>
+ #include <net/arp.h>
+ #include <net/sock.h>
+@@ -210,7 +211,7 @@ __be16 eth_type_trans(struct sk_buff *sk
+ 	 *      layer. We look for FFFF which isn't a used 802.2 SSAP/DSAP. This
+ 	 *      won't work for fault tolerant netware but does for the rest.
+ 	 */
+-	if (skb->len >= 2 && *(unsigned short *)(skb->data) == 0xFFFF)
++	if (skb->len >= 2 && get_unaligned((unsigned short *) skb->data) == 0xFFFF)
+ 		return htons(ETH_P_802_3);
+ 
+ 	/*
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@ -231,7 +231,8 @@ static int esp_output(struct xfrm_state
+ 			break;
+ 		case UDP_ENCAP_ESPINUDP_NON_IKE:
+ 			udpdata32 = (__be32 *)(uh + 1);
+-			udpdata32[0] = udpdata32[1] = 0;
++			put_unaligned(0, &udpdata32[0]);
++			put_unaligned(0, &udpdata32[1]);
+ 			esph = (struct ip_esp_hdr *)(udpdata32 + 2);
+ 			break;
+ 		}
+--- a/net/ipv4/gre.c
++++ b/net/ipv4/gre.c
+@@ -46,7 +46,7 @@ err_out_unlock:
+ err_out:
+ 	return -1;
+ }
+-EXPORT_SYMBOL_GPL(gre_add_protocol);
++EXPORT_SYMBOL(gre_add_protocol);
+ 
+ int gre_del_protocol(const struct gre_protocol *proto, u8 version)
+ {
+@@ -67,7 +67,7 @@ err_out_unlock:
+ err_out:
+ 	return -1;
+ }
+-EXPORT_SYMBOL_GPL(gre_del_protocol);
++EXPORT_SYMBOL(gre_del_protocol);
+ 
+ static int gre_rcv(struct sk_buff *skb)
+ {
+--- a/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
++++ b/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+@@ -8,6 +8,7 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#include <asm/unaligned.h>
+ #include <linux/types.h>
+ #include <linux/ip.h>
+ #include <linux/netfilter.h>
+@@ -40,8 +41,8 @@ static bool ipv4_pkt_to_tuple(const stru
+ 	if (ap == NULL)
+ 		return false;
+ 
+-	tuple->src.u3.ip = ap[0];
+-	tuple->dst.u3.ip = ap[1];
++	tuple->src.u3.ip = get_unaligned(&ap[0]);
++	tuple->dst.u3.ip = get_unaligned(&ap[1]);
+ 
+ 	return true;
+ }
+--- a/net/netfilter/nf_nat_proto_tcp.c
++++ b/net/netfilter/nf_nat_proto_tcp.c
+@@ -17,6 +17,7 @@
+ #include <net/netfilter/nf_nat_l3proto.h>
+ #include <net/netfilter/nf_nat_l4proto.h>
+ #include <net/netfilter/nf_nat_core.h>
++#include <asm/unaligned.h>
+ 
+ static u16 tcp_port_rover;
+ 
+@@ -63,8 +64,8 @@ tcp_manip_pkt(struct sk_buff *skb,
+ 		portptr = &hdr->dest;
+ 	}
+ 
+-	oldport = *portptr;
+-	*portptr = newport;
++	oldport = get_unaligned(portptr);
++	put_unaligned(newport, portptr);
+ 
+ 	if (hdrsize < sizeof(*hdr))
+ 		return true;
+--- a/net/netfilter/nf_nat_proto_udp.c
++++ b/net/netfilter/nf_nat_proto_udp.c
+@@ -16,6 +16,7 @@
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_l3proto.h>
+ #include <net/netfilter/nf_nat_l4proto.h>
++#include <asm/unaligned.h>
+ 
+ static u16 udp_port_rover;
+ 
+@@ -56,12 +57,12 @@ udp_manip_pkt(struct sk_buff *skb,
+ 	if (hdr->check || skb->ip_summed == CHECKSUM_PARTIAL) {
+ 		l3proto->csum_update(skb, iphdroff, &hdr->check,
+ 				     tuple, maniptype);
+-		inet_proto_csum_replace2(&hdr->check, skb, *portptr, newport,
++		inet_proto_csum_replace2(&hdr->check, skb, get_unaligned(portptr), newport,
+ 					 0);
+ 		if (!hdr->check)
+ 			hdr->check = CSUM_MANGLED_0;
+ 	}
+-	*portptr = newport;
++	put_unaligned(newport, portptr);
+ 	return true;
+ }
+ 
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3624,14 +3624,14 @@ static bool tcp_parse_aligned_timestamp(
+ {
+ 	const __be32 *ptr = (const __be32 *)(th + 1);
+ 
+-	if (*ptr == htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16)
++	if (get_unaligned_be32(ptr) == htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16)
+ 			  | (TCPOPT_TIMESTAMP << 8) | TCPOLEN_TIMESTAMP)) {
+ 		tp->rx_opt.saw_tstamp = 1;
+ 		++ptr;
+-		tp->rx_opt.rcv_tsval = ntohl(*ptr);
++		tp->rx_opt.rcv_tsval = ntohl(get_unaligned(ptr));
+ 		++ptr;
+-		if (*ptr)
+-			tp->rx_opt.rcv_tsecr = ntohl(*ptr) - tp->tsoffset;
++		if (get_unaligned(ptr))
++			tp->rx_opt.rcv_tsecr = ntohl(get_unaligned(ptr)) - tp->tsoffset;
+ 		else
+ 			tp->rx_opt.rcv_tsecr = 0;
+ 		return true;
+--- a/net/ipv4/xfrm4_policy.c
++++ b/net/ipv4/xfrm4_policy.c
+@@ -15,6 +15,7 @@
+ #include <net/dst.h>
+ #include <net/xfrm.h>
+ #include <net/ip.h>
++#include <asm/unaligned.h>
+ 
+ static struct xfrm_policy_afinfo xfrm4_policy_afinfo;
+ 
+@@ -119,9 +120,8 @@ _decode_session4(struct sk_buff *skb, st
+ 			    pskb_may_pull(skb, xprth + 4 - skb->data)) {
+ 				__be16 *ports = (__be16 *)xprth;
+ 
+-				fl4->fl4_sport = ports[!!reverse];
+-				fl4->fl4_dport = ports[!reverse];
+-			}
++				fl4->fl4_sport = get_unaligned(ports + !!reverse);
++				fl4->fl4_dport = get_unaligned(ports + !reverse);			}
+ 			break;
+ 
+ 		case IPPROTO_ICMP:
+@@ -137,7 +137,7 @@ _decode_session4(struct sk_buff *skb, st
+ 			if (pskb_may_pull(skb, xprth + 4 - skb->data)) {
+ 				__be32 *ehdr = (__be32 *)xprth;
+ 
+-				fl4->fl4_ipsec_spi = ehdr[0];
++				fl4->fl4_ipsec_spi = get_unaligned(ehdr + 0);
+ 			}
+ 			break;
+ 
+@@ -145,7 +145,7 @@ _decode_session4(struct sk_buff *skb, st
+ 			if (pskb_may_pull(skb, xprth + 8 - skb->data)) {
+ 				__be32 *ah_hdr = (__be32 *)xprth;
+ 
+-				fl4->fl4_ipsec_spi = ah_hdr[1];
++				fl4->fl4_ipsec_spi = get_unaligned(ah_hdr + 1);
+ 			}
+ 			break;
+ 
+@@ -153,7 +153,8 @@ _decode_session4(struct sk_buff *skb, st
+ 			if (pskb_may_pull(skb, xprth + 4 - skb->data)) {
+ 				__be16 *ipcomp_hdr = (__be16 *)xprth;
+ 
+-				fl4->fl4_ipsec_spi = htonl(ntohs(ipcomp_hdr[1]));
++				fl4->fl4_ipsec_spi = htonl(ntohs(get_unaligned(ipcomp_hdr + 1)));
++				    htonl(ntohs(get_unaligned(ipcomp_hdr + 1)));
+ 			}
+ 			break;
+ 
+@@ -165,7 +166,7 @@ _decode_session4(struct sk_buff *skb, st
+ 				if (greflags[0] & GRE_KEY) {
+ 					if (greflags[0] & GRE_CSUM)
+ 						gre_hdr++;
+-					fl4->fl4_gre_key = gre_hdr[1];
++					fl4->fl4_gre_key = get_unaligned(gre_hdr + 1);
+ 				}
+ 			}
+ 			break;
