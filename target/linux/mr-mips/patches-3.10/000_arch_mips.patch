@@ -649,7 +649,7 @@
   * so wait up to worst case number of cycle counter ticks for timer interrupt
   * changes to propagate to the cause register.
   */
-+#define back_to_back_c0_hazard() \
++#define back_to_back_c0_hazard4() \
 +	do { \
 +		back_to_back_c0_hazard(); \
 +		back_to_back_c0_hazard(); \
@@ -660,6 +660,33 @@
  #define COMPARE_INT_SEEN_TICKS 50
  
  int c0_compare_int_usable(void)
+@@ -129,7 +137,7 @@ int c0_compare_int_usable(void)
+ 	if (c0_compare_int_pending()) {
+ 		cnt = read_c0_count();
+ 		write_c0_compare(cnt);
+-		back_to_back_c0_hazard();
++		back_to_back_c0_hazard4();
+ 		while (read_c0_count() < (cnt  + COMPARE_INT_SEEN_TICKS))
+ 			if (!c0_compare_int_pending())
+ 				break;
+@@ -141,7 +149,7 @@ int c0_compare_int_usable(void)
+ 		cnt = read_c0_count();
+ 		cnt += delta;
+ 		write_c0_compare(cnt);
+-		back_to_back_c0_hazard();
++		back_to_back_c0_hazard4();
+ 		if ((int)(read_c0_count() - cnt) < 0)
+ 		    break;
+ 		/* increase delta if the timer was already expired */
+@@ -157,7 +165,7 @@ int c0_compare_int_usable(void)
+ 		return 0;
+ 	cnt = read_c0_count();
+ 	write_c0_compare(cnt);
+-	back_to_back_c0_hazard();
++	back_to_back_c0_hazard4();
+ 	while (read_c0_count() < (cnt + COMPARE_INT_SEEN_TICKS))
+ 		if (!c0_compare_int_pending())
+ 			break;
 --- a/arch/mips/kernel/head.S
 +++ b/arch/mips/kernel/head.S
 @@ -146,7 +146,7 @@ EXPORT(__image_cmdline)
@@ -1129,7 +1156,7 @@
 --- /dev/null
 +++ b/arch/mips/rb/Makefile
 @@ -0,0 +1 @@
-+obj-y += prom.o irq.o iomap.o
++obj-y += prom.o platform.o irq.o
 --- /dev/null
 +++ b/arch/mips/rb/Platform
 @@ -0,0 +1,13 @@
@@ -1148,7 +1175,7 @@
 +
 --- /dev/null
 +++ b/arch/mips/rb/irq.c
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,108 @@
 +#include <linux/init.h>
 +#include <linux/linkage.h>
 +#include <linux/irq.h>
@@ -1161,11 +1188,6 @@
 +#include <asm/bootinfo.h>
 +#include <asm/vm.h>
 +#include <asm/rb/boards.h>
-+
-+extern void rb500_init_irq(void);
-+extern void rb100_init_irq(void);
-+extern void rb400_init_irq(void);
-+extern void cr_init_irq(void);
 +
 +asmlinkage void plat_irq_dispatch(void) {
 +	unsigned pending = read_c0_status() & read_c0_cause() & 0xfe00;
@@ -1226,7 +1248,7 @@
 +	set_c0_status(0x100 << (d->irq - MIPS_CPU_IRQ_BASE));
 +	irq_enable_hazard();
 + }
-+ 
++
 +static inline void mask_soft_irq(struct irq_data *d)
 +{
 +	clear_c0_status(0x100 << (d->irq - MIPS_CPU_IRQ_BASE));
@@ -1247,19 +1269,6 @@
 +	unsigned i;
 +
 +	switch (mips_machgroup) {
-+	case MACH_GROUP_MT_RB500:
-+		rb500_init_irq();
-+		break;
-+	case MACH_GROUP_MT_RB100:
-+		rb100_init_irq();
-+		break;
-+	case MACH_GROUP_MT_RB400:
-+	case MACH_GROUP_MT_RB700:
-+		rb400_init_irq();
-+		break;
-+	case MACH_GROUP_MT_CR:
-+		cr_init_irq();
-+		break;
 +	case MACH_GROUP_MT_VM:
 +		mips_cpu_irq_init();
 +		break;
@@ -1269,7 +1278,7 @@
 +	    mips_machgroup != MACH_GROUP_MT_RB100) {
 +		irq_set_chip_and_handler(1, &soft_irq_controller, handle_percpu_irq);
 +		setup_irq(1, &virq_cascade);
-+		
++
 +		for (i = VIRQ_BASE;  i < VIRQ_BASE + 32; ++i)
 +			irq_set_chip_and_handler(i, &virq_controller,
 +						 handle_edge_irq);
@@ -1277,7 +1286,7 @@
 +}
 --- /dev/null
 +++ b/arch/mips/rb/prom.c
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,152 @@
 +#include <linux/init.h>
 +#include <linux/mm.h>
 +#include <linux/module.h>
@@ -1296,10 +1305,6 @@
 +
 +#define SR_NMI	0x00180000
 +
-+extern void rb500_setup(void);
-+extern void rb100_setup(void);
-+extern void rb400_setup(void);
-+extern void cr_setup(void);
 +extern void rbvm_setup(void);
 +
 +extern char arcs_cmdline[COMMAND_LINE_SIZE];
@@ -1312,179 +1317,9 @@
 +unsigned long mips_machgroup __read_mostly = 0;
 +EXPORT_SYMBOL(mips_machgroup);
 +
-+static unsigned get_flash_base(void) {
-+    switch (mips_machtype) {
-+    case MACH_MT_RB951:
-+	return 0x1f000000;
-+    default:
-+	return 0x1fc00000;
-+    }
-+}
-+
-+static void nor_read(void *buf, int count, unsigned long offset) {
-+    static unsigned char *flash_base = NULL;
-+    if (!flash_base) flash_base = ioremap_nocache(get_flash_base(), 0x20000);
-+    memcpy(buf, flash_base + offset, count);
-+}
-+
-+static unsigned read_unsigned(unsigned *offset) {
-+    unsigned val = 0;
-+    nor_read(&val, sizeof(unsigned), *offset);
-+    *offset += sizeof(unsigned);
-+    return val;    
-+}
-+
-+int read_booter_cfg(unsigned id, void *buf, int amount) {
-+    unsigned offset;
-+    unsigned hcfg_offset;
-+    unsigned hcfg_size;
-+    if (mips_machgroup != MACH_GROUP_MT_RB700
-+	&& mips_machgroup != MACH_GROUP_MT_RB400) {
-+	printk("read_booter_cfg not implemented for this hardware");
-+	return -1;
-+    }    
-+    else {
-+	offset = 0x24;
-+    }
-+    hcfg_offset = read_unsigned(&offset);
-+    hcfg_size = read_unsigned(&offset);
-+    printk("hcfg_offset=%08x\n", hcfg_offset);
-+    printk("hcfg_size=%08x\n", hcfg_size);
-+    offset = hcfg_offset;
-+    if (read_unsigned(&offset) != 0x64726148) return 0;
-+    while (offset < hcfg_offset + hcfg_size) {
-+	unsigned data = read_unsigned(&offset);
-+	unsigned tag = data & 0xffff;	
-+	int len = data >> 16;	
-+	if (len == 0 || len > hcfg_size || tag == 0) {
-+	    break;
-+	} else if (tag == id) {
-+	    amount = min(len, amount);
-+	    nor_read(buf, amount, offset);
-+	    return amount;
-+	}
-+	offset = offset + len;
-+    }
-+    return 0;
-+}
-+
 +const char *get_system_type(void)
 +{
 +	switch (mips_machgroup) {
-+	case MACH_GROUP_MT_RB100:
-+		switch (mips_machtype) {
-+		case MACH_MT_RB100:
-+			return "Mikrotik RB100";
-+		case MACH_MT_RB150:
-+			return "Mikrotik RB150";
-+		case MACH_MT_RB133:
-+			return "Mikrotik RB133";
-+		case MACH_MT_RB133C:
-+			return "Mikrotik RB133C";
-+		case MACH_MT_RB192:
-+			return "Mikrotik RB192";
-+		case MACH_MT_MR:
-+			return "Mikrotik MR";
-+		}
-+		break;
-+	case MACH_GROUP_MT_RB500:
-+		switch (mips_machtype) {
-+		case MACH_MT_RB500:
-+			return "Mikrotik RB500";
-+		case MACH_MT_RB500R5:
-+			return "Mikrotik RB500r5";
-+		}
-+		break;
-+	case MACH_GROUP_MT_RB400:
-+		switch (mips_machtype) {
-+		case MACH_MT_RB411:
-+			return "Mikrotik RB411";
-+		case MACH_MT_RB411U:
-+			return "Mikrotik RB411U";
-+		case MACH_MT_RB411L:
-+			return "Mikrotik RB411L";
-+		case MACH_MT_RB411UL:
-+			return "Mikrotik RB411UL";
-+		case MACH_MT_RB411G:
-+			return "Mikrotik RB411GL";
-+		case MACH_MT_RB433:
-+			return "Mikrotik RB433";
-+		case MACH_MT_RB433U:
-+			return "Mikrotik RB433U";
-+		case MACH_MT_RB433GL:
-+			return "Mikrotik RB433GL";
-+		case MACH_MT_RB433UL:
-+			return "Mikrotik RB433UL";
-+		case MACH_MT_RB433L:
-+			return "Mikrotik RB433L";
-+		case MACH_MT_RB435G:
-+			return "Mikrotik RB435G";
-+		case MACH_MT_RB450:
-+			return "Mikrotik RB450";
-+		case MACH_MT_RB450G:
-+			return "Mikrotik RB450G";
-+		case MACH_MT_RB493:
-+			return "Mikrotik RB493";
-+		case MACH_MT_RB750G:
-+			return "Mikrotik RB750G";
-+		}
-+		break;
-+	case MACH_GROUP_MT_RB700:
-+		switch (mips_machtype) {
-+		case MACH_MT_RB711R3:
-+		case MACH_MT_RB711:
-+			return "Mikrotik RB711";
-+		case MACH_MT_RB_SXT5D:
-+			return "Mikrotik SXT 5-HnD";
-+		case MACH_MT_RB_GROOVE:
-+		case MACH_MT_RB_GROOVE_5S:
-+			return "Mikrotik Groove-5H";
-+		case MACH_MT_RB751G:
-+			return "Mikrotik RB751G";
-+		case MACH_MT_RB912G:
-+			return "Mikrotik RB912G";
-+		case MACH_MT_RB711G:
-+			return "Mikrotik RB711G";
-+		case MACH_MT_RB_SXTG:
-+			return "Mikrotik SXT G-5HnD";
-+		case MACH_MT_RB750GL:
-+			return "Mikrotik RB750GL";
-+		case MACH_MT_SXT2D:
-+			return "Mikrotik SXT 2nD";
-+		case MACH_MT_SXT5N:
-+			return "Mikrotik SXT 5nD";
-+		case MACH_MT_RB2011G:
-+			return "Mikrotik RB2011UAS-2HnD";
-+		case MACH_MT_RB2011US:
-+			return "Mikrotik RB2011UAS";
-+		case MACH_MT_RB2011L:
-+			return "Mikrotik RB2011L";
-+		case MACH_MT_RB2011LS:
-+			return "Mikrotik RB2011LS";
-+		case MACH_MT_RB2011R5:
-+			return "Mikrotik RB2011";
-+		case MACH_MT_CRS125G:
-+			return "Mikrotik CRS125G";
-+		case MACH_MT_RB951G:
-+			return "Mikrotik RB951G";
-+		case MACH_MT_RB951:
-+			return "Mikrotik RB951-2n";
-+		case MACH_MT_GROOVE52:
-+			return "Mikrotik Groove 52HPn";
-+		case MACH_MT_RB750:
-+			return "Mikrotik RB750";
-+		case MACH_MT_RB751:
-+			return "Mikrotik RB751";
-+		case MACH_MT_RB_OMNI:
-+		case MACH_MT_RB_OMNI_5FE:
-+			return "Mikrotik OmniTIK";
-+		}
-+		break;
-+	case MACH_GROUP_MT_CR:
-+		switch (mips_machtype) {
-+		case MACH_MT_CR1:
-+			return "Mikrotik CR";
-+		}
 +	case MACH_GROUP_MT_VM:
 +		return "Mikrotik VM";
 +	}
@@ -1506,7 +1341,7 @@
 +	/* HZ must be parsed here because otherwise is too late */
 +	for (i = 0; (i < argc && argv[i] != NULL); i++) {
 +		if (strncmp(argv[i], FREQ_TAG, sizeof(FREQ_TAG) - 1) == 0) {
-+			mips_hpt_frequency = 
++			mips_hpt_frequency =
 +			    simple_strtoul(argv[i] + sizeof(FREQ_TAG) - 1, 0, 10);
 +			continue;
 +		}
@@ -1518,160 +1353,8 @@
 +				   "%s ", argv[i]);
 +	}
 +
-+	if (strncmp(board_type, "500r5", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB500;
-+		mips_machtype = MACH_MT_RB500R5;
-+	} else if (strncmp(board_type, "411", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB411;
-+	} else if (strncmp(board_type, "411L", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB411L;
-+	} else if (strncmp(board_type, "411UL", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB411UL;
-+	} else if (strncmp(board_type, "411G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB411G;
-+	} else if (strncmp(board_type, "750G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB750G;
-+	} else if (strncmp(board_type, "750i", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB750;
-+	} else if (strncmp(board_type, "751", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB751;
-+	} else if (strncmp(board_type, "711r3", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB711R3;
-+	} else if (strncmp(board_type, "711", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB711;
-+	} else if (strncmp(board_type, "groove", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_SXT5D;
-+	} else if (strncmp(board_type, "751g", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB751G;
-+	} else if (strncmp(board_type, "711G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB711G;
-+	} else if (strncmp(board_type, "SXTG", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_SXTG;
-+	} else if (strncmp(board_type, "711Gr100", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB912G;
-+	} else if (strncmp(board_type, "750Gr3", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB750GL;
-+	} else if (strncmp(board_type, "sxt2d", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_SXT2D;
-+	} else if (strncmp(board_type, "sxt5n", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_SXT5N;
-+	} else if (strncmp(board_type, "2011G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB2011G;
-+	} else if (strncmp(board_type, "2011US", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB2011US;
-+	} else if (strncmp(board_type, "2011L", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB2011L;
-+	} else if (strncmp(board_type, "2011LS", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB2011LS;
-+	} else if (strncmp(board_type, "2011r5", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB2011R5;
-+	} else if (strncmp(board_type, "crs125g", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_CRS125G;
-+	} else if (strncmp(board_type, "951G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB951G;
-+	} else if (strncmp(board_type, "751UL", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB951;
-+	} else if (strncmp(board_type, "groove-52", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_GROOVE52;
-+	} else if (strncmp(board_type, "groove-5", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_GROOVE;
-+	} else if (strncmp(board_type, "groove-5s", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_GROOVE_5S;
-+	} else if (strncmp(board_type, "omni", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_OMNI;
-+	} else if (strncmp(board_type, "omni-5fe", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB700;
-+		mips_machtype = MACH_MT_RB_OMNI_5FE;
-+	} else if (strncmp(board_type, "411U", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB411U;
-+	} else if (strncmp(board_type, "433", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB433;
-+	} else if (strncmp(board_type, "433U", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB433U;
-+	} else if (strncmp(board_type, "433GL", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB433GL;
-+	} else if (strncmp(board_type, "433UL", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB433UL;
-+	} else if (strncmp(board_type, "433L", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB433L;
-+	} else if (strncmp(board_type, "435G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB435G;
-+	} else if (strncmp(board_type, "450", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB450;
-+	} else if (strncmp(board_type, "450G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB450G;
-+	} else if (strncmp(board_type, "493G", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB493G;
-+	} else if (strncmp(board_type, "493", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB400;
-+		mips_machtype = MACH_MT_RB493;
-+	} else if (strncmp(board_type, "100", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_RB100;
-+	} else if (strncmp(board_type, "150", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_RB150;
-+	} else if (strncmp(board_type, "133", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_RB133;
-+	} else if (strncmp(board_type, "133C", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_RB133C;
-+	} else if (strncmp(board_type, "192", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_RB192;
-+	} else if (strncmp(board_type, "mr", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_RB100;
-+		mips_machtype = MACH_MT_MR;
-+	} else if (strncmp(board_type, "cr", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_CR;
-+		mips_machtype = MACH_MT_CR1;
-+	} else if (strncmp(board_type, "vm", sizeof(board_type)) == 0) {
-+		mips_machgroup = MACH_GROUP_MT_VM;
-+		mips_machtype = 0;
-+	} else {
-+		mips_machgroup = MACH_GROUP_MT_RB500;
-+		mips_machtype = MACH_MT_RB500;
-+	}
++	mips_machgroup = MACH_GROUP_MT_VM;
++	mips_machtype = 0;
 +}
 +
 +void __init prom_free_prom_memory(void)
@@ -1707,22 +1390,9 @@
 +		initrd_start = (unsigned long) (initrd_header + 2);
 +                initrd_end = initrd_start + initrd_header[1];
 +	}
-+#endif    
++#endif
 +
 +	switch (mips_machgroup) {
-+	case MACH_GROUP_MT_RB500:
-+		rb500_setup();
-+		break;
-+	case MACH_GROUP_MT_RB100:
-+		rb100_setup();
-+		break;
-+	case MACH_GROUP_MT_RB400:
-+	case MACH_GROUP_MT_RB700:
-+		rb400_setup();
-+		break;
-+	case MACH_GROUP_MT_CR:
-+		cr_setup();
-+		break;
 +	case MACH_GROUP_MT_VM:
 +		rbvm_setup();
 +		break;
@@ -1830,7 +1500,7 @@
 +		local_irq_restore(flags);
 +		return 0;
 +	}
-+	
++
 +	len = min_t(int, len, rx_chain[cur_rx].size & ~DONE);
 +	memcpy(buf, rx_buffers[cur_rx], len);
 +
@@ -1892,7 +1562,7 @@
 +		rx_chain[i].addr = (unsigned) rx_buffers[i];
 +		rx_chain[i].size = BUF_SIZE;
 +		rx_chain[i].next = (unsigned) &rx_chain[i + 1];
-+		
++
 +		tx_chain[i].addr = (unsigned) tx_buffers[i];
 +		tx_chain[i].size = 0;
 +		tx_chain[i].next = (unsigned) &tx_chain[i + 1];
@@ -1942,3 +1612,14 @@
  	return retval;
  }
  
+--- /dev/null
++++ b/arch/mips/rb/platform.c
+@@ -0,0 +1,8 @@
++#include <linux/init.h>
++
++int rb_platform_init(void)
++{
++	return 0;
++}
++
++arch_initcall(rb_platform_init);
