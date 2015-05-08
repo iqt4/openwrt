@@ -1,27 +1,9 @@
 --- a/drivers/net/ethernet/Kconfig
 +++ b/drivers/net/ethernet/Kconfig
-@@ -85,6 +85,29 @@ config LANTIQ_ETOP
+@@ -85,6 +85,11 @@ config LANTIQ_ETOP
  	---help---
  	  Support for the MII0 inside the Lantiq SoC
  
-+config RBKORINA
-+	tristate "RB500 Korina ethernet support"
-+	depends on MIPS_MIKROTIK
-+	help
-+	  This is idt mips chip built-in ethernet port.
-+
-+	  To compile this driver as a module, choose M here and read
-+	  <file:Documentation/networking/net-modules.txt>. The module
-+	  will be called korina.
-+
-+config ADM5120_ETH
-+	tristate "RB100 ADM5120 ethernet support"
-+	depends on MIPS_MIKROTIK
-+
-+config CRETHER
-+	tristate "RB CR ethernet support"
-+	depends on MIPS_MIKROTIK
-+
 +config MT_VETH
 +	bool "MetaROUTER Virtual Ethernet support"
 +	depends on METAROUTER || MIPS_MIKROTIK
@@ -32,13 +14,10 @@
  source "drivers/net/ethernet/micrel/Kconfig"
 --- a/drivers/net/ethernet/Makefile
 +++ b/drivers/net/ethernet/Makefile
-@@ -35,6 +35,10 @@ obj-$(CONFIG_NET_VENDOR_XSCALE) += xscal
+@@ -35,6 +35,7 @@ obj-$(CONFIG_NET_VENDOR_XSCALE) += xscal
  obj-$(CONFIG_IP1000) += icplus/
  obj-$(CONFIG_JME) += jme.o
  obj-$(CONFIG_KORINA) += korina.o
-+obj-$(CONFIG_RBKORINA) += rbkorina.o
-+obj-$(CONFIG_ADM5120_ETH) += admtek.o
-+obj-$(CONFIG_CRETHER) += crether.o
 +obj-$(CONFIG_MT_VETH) += mtveth.o
  obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
  obj-$(CONFIG_NET_VENDOR_MARVELL) += marvell/
@@ -98,7 +77,7 @@
 +{
 +	struct veth_private *veth = netdev_priv(dev);
 +	unsigned cur = atomic_read(&cur_tx) % TXBUF_COUNT;
-+    
++
 +	if (skb_padto(skb, ETH_ZLEN))
 +		return NETDEV_TX_OK;
 +
@@ -278,7 +257,7 @@
 +
 +		if (msg->id >= MAX_IFACES || !devs[msg->id])
 +			return -EINVAL;
-+		
++
 +		dev = devs[msg->id];
 +		devs[msg->id] = NULL;
 +
@@ -321,7 +300,7 @@
 +	}
 +	tx_descr[TXBUF_COUNT - 1].next = (unsigned) &tx_descr[0];
 +	rx_descr[RXBUF_COUNT - 1].next = (unsigned) &rx_descr[0];
-+	
++
 +	vm_create_queue(3, 3,
 +			(unsigned) &tx_descr[0], (unsigned) &rx_descr[0]);
 +
